@@ -2,57 +2,6 @@ locals {
   name_prefix = "LAC"
 }
 
-## ACM Module for creation of ACM Cert
-module "acm" {
-  source  = "terraform-aws-modules/acm/aws"
-  version = "5.1.1"
-
-  domain_name  = "shortener.lac.com"
-  zone_id      = data.aws_route53_zone.sctp_zone.zone_id
-
-  validation_method = "DNS"
-
-  subject_alternative_names = [
-    "shortener.my-domain.com",
-    "app.lac.my-domain.com",
-  ]
-
-  wait_for_validation = true
-
-  tags = {
-    Name = "shortener.lac.com"
-  }
-}
-
-## API Gateway + Custom Domain
-
-resource "aws_route53_record" "www" {
-  zone_id = data.aws_route53_zone.sctp_zone.zone_id
-  name    = "LAC_shortener"
-  type    = "A"
-
-    alias {
-    name                   = "LAC_shortener"
-    zone_id                = data.aws_route53_zone.sctp_zone.zone_id
-    evaluate_target_health = false
-    }
-}
-
-resource "aws_api_gateway_domain_name" "shortener" {
-  domain_name              = "shortener.lac.com"
-  regional_certificate_arn = module.acm.acm_certificate_arn.arn
-
-  endpoint_configuration {
-    types = ["REGIONAL"]
-  }
-}
-
-# resource "aws_api_gateway_base_path_mapping" "shortener" {
-#   api_id      = aws_api_gateway_rest_api.shortener.id
-#   stage_name  = aws_api_gateway_stage.shortener.stage_name
-#   domain_name = aws_api_gateway_domain_name.shortener.domain_name
-# }
-
 ## Logging ONLY blocked requests for WAF
 
 # resource "aws_wafv2_web_acl_logging_configuration" "api_gw_waf_logging" {
