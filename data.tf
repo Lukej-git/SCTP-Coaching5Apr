@@ -13,3 +13,7 @@ data "archive_file" "lambda_package" {
   source_dir  = "${path.module}/package"
   output_path = "${path.module}/lambda.zip"
 }
+
+data "aws_route53_zone" "sctp_zone" {
+  name = "sctp-sandbox.com"
+}

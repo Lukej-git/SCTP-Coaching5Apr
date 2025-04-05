@@ -1,145 +1,152 @@
 locals {
   name_prefix = "LAC"
-  tags = {
-    Purpose = "CE 9 - Coaching5Apr"
-  }
 }
 
-module "vpc" {
-  source  = "terraform-aws-modules/vpc/aws"
-  version = "5.19.0"
-  name    = "${local.name_prefix}-vpc"
+## ACM Module for creation of ACM Cert
+module "acm" {
+  source  = "terraform-aws-modules/acm/aws"
+  version = "5.1.1"
 
-  cidr             = "10.0.0.0/16"
-  azs              = slice(data.aws_availability_zones.available.names, 0, 3)
-  private_subnets  = ["10.0.1.0/24", "10.0.2.0/24", "10.0.3.0/24"]
-  public_subnets   = ["10.0.101.0/24", "10.0.102.0/24", "10.0.103.0/24"]
-  database_subnets = ["10.0.201.0/24", "10.0.202.0/24", "10.0.203.0/24"]
+  domain_name  = "shortener.lac.com"
+  zone_id      = data.aws_route53_zone.sctp_zone.zone_id
 
-  enable_nat_gateway           = false
-  single_nat_gateway           = true
-  enable_dns_hostnames         = true
-  create_database_subnet_group = true
+  validation_method = "DNS"
 
-  tags = local.tags
-}
-
-module "security_group" {
-  source  = "terraform-aws-modules/security-group/aws"
-  version = "~> 5.0"
-
-  name        = "${local.name_prefix}-rds-sg"
-  description = "MySQL security group"
-  vpc_id      = module.vpc.vpc_id
-
-  # ingress
-  egress_with_cidr_blocks = [
-    {
-      from_port   = 3306
-      to_port     = 3306
-      protocol    = "tcp"
-      description = "MySQL access from within lambda"
-      cidr_blocks = module.vpc.vpc_cidr_block
-    },
+  subject_alternative_names = [
+    "shortener.my-domain.com",
+    "app.lac.my-domain.com",
   ]
 
-  tags = local.tags
-}
+  wait_for_validation = true
 
-module "db" {
-  source     = "terraform-aws-modules/rds/aws"
-  version    = "6.10.0"
-  identifier = "${local.name_prefix}-rds"
-  manage_master_user_password = true
-
-  # Supported - https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/Concepts.DBInstanceClass.Support.html
-  engine               = "mysql"
-  engine_version       = "8.0"
-  family               = "mysql8.0" # DB parameter group
-  major_engine_version = "8.0"      # DB option group
-  instance_class       = "db.t3.micro"
-
-  allocated_storage     = 20
-  max_allocated_storage = 22
-  storage_encrypted     = false
-
-  db_name  = "${local.name_prefix}sandboxdb"
-  username = "${local.name_prefix}dbadmin"
-  port     = 3306
-
-  db_subnet_group_name   = module.vpc.database_subnet_group
-  vpc_security_group_ids = [module.security_group.security_group_id]
-
-  skip_final_snapshot = true
-  deletion_protection = false
-
-  tags = local.tags
-}
-
-output "private_subnets" {
-  value = module.vpc.private_subnets
-}
-
-output "nat_gateway_ids" {
-  value = module.vpc.natgw_ids
-}
-
-# Lambda Function
-resource "aws_lambda_function" "moviesdb_api" {
-  function_name = "${local.name_prefix}-moviesdb-api"
-  runtime       = "python3.11"  # Replace with the latest supported Python version
-  handler       = "lambda_function.lambda_handler"
-  role          = aws_iam_role.lambda_exec.arn
-  vpc_config {
-    subnet_ids         = module.vpc.private_subnets
-    security_group_ids = [module.security_group.security_group_id]
+  tags = {
+    Name = "shortener.lac.com"
   }
+}
 
-  environment {
-    variables = {
-      DB_NAME     = module.db.db_instance_name
-      USERNAME    = module.db.db_instance_username
-      RDS_ENDPOINT = module.db.db_instance_endpoint
-      DB_CREDENTIALS_SECRET_NAME = data.aws_secretsmanager_secret.cluster_secret.name
+## API Gateway + Custom Domain
+
+resource "aws_route53_record" "www" {
+  zone_id = data.aws_route53_zone.sctp_zone.zone_id
+  name    = "LAC_shortener"
+  type    = "A"
+
+    alias {
+    name                   = "LAC_shortener"
+    zone_id                = data.aws_route53_zone.sctp_zone.zone_id
+    evaluate_target_health = false
     }
+}
+
+resource "aws_api_gateway_domain_name" "shortener" {
+  domain_name              = "shortener.lac.com"
+  regional_certificate_arn = module.acm.acm_certificate_arn.arn
+
+  endpoint_configuration {
+    types = ["REGIONAL"]
   }
-  
-  filename         = data.archive_file.lambda_package.output_path
-  source_code_hash = data.archive_file.lambda_package.output_base64sha256
 }
 
+# resource "aws_api_gateway_base_path_mapping" "shortener" {
+#   api_id      = aws_api_gateway_rest_api.shortener.id
+#   stage_name  = aws_api_gateway_stage.shortener.stage_name
+#   domain_name = aws_api_gateway_domain_name.shortener.domain_name
+# }
 
-# IAM Role for Lambda Execution
-resource "aws_iam_role" "lambda_exec" {
-  name = "${local.name_prefix}-moviesdb-api-role"
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Action = "sts:AssumeRole"
-      Effect = "Allow"
-      Principal = {
-        Service = "lambda.amazonaws.com"
-      }
-    }]
-  })
-}
+## Logging ONLY blocked requests for WAF
 
-resource "aws_iam_policy_attachment" "lambda_basic_execution" {
-  name       = "${local.name_prefix}-lambda-basic-execution"
-  roles      = [aws_iam_role.lambda_exec.name]
-  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
-}
+# resource "aws_wafv2_web_acl_logging_configuration" "api_gw_waf_logging" {
+#   resource_arn = aws_wafv2_web_acl.api_gw_waf.arn
+#   log_destination_configs = [
+#     aws_cloudwatch_log_group.waf_logs.arn
+#   ]
 
-# Grant Lambda access to Secrets Manager
-resource "aws_iam_policy" "secrets_access" {
-  name = "${local.name_prefix}-secrets-access"
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Effect   = "Allow"
-      Action   = ["secretsmanager:GetSecretValue"]
-      Resource = module.db.db_instance_master_user_secret_arn
-    }]
-  })
-}
+#   logging_filter {
+#     # Default behavior when no filters match
+#     default_behavior = "DROP" # means "do not log" if no filter matches
 
+#     filter {
+#       behavior    = "KEEP" # keep logs if the condition matches
+#       requirement = "MEETS_ANY"
+
+#       condition {
+#         action_condition {
+#           action = "BLOCK"
+#         }
+#       }
+#     }
+#   }
+# }
+
+## API Gateway POST Resources
+
+############# CREATE URL RESOURCES#####################
+# resource "aws_api_gateway_resource" "newurl" {}
+
+# resource "aws_api_gateway_method" "post_method" {}
+
+# resource "aws_api_gateway_integration" "post_integration" {
+#   rest_api_id             =
+#   resource_id             = 
+#   http_method             = 
+#   integration_http_method = "POST"
+#   type                    = "AWS_PROXY"
+#   uri                     = 
+# }
+
+# resource "aws_api_gateway_method_response" "response_200" {
+#   rest_api_id = aws_api_gateway_rest_api.api.id
+#   resource_id = aws_api_gateway_resource.newurl.id
+#   http_method = aws_api_gateway_method.post_method.http_method
+#   status_code = "200"
+
+#   response_models = {
+#     "application/json" = "Empty"
+#   }
+# }
+
+## API Gateway GET Resources
+# resource "aws_api_gateway_resource" "geturl" {}
+
+# resource "aws_api_gateway_method" "get_method" {}
+
+# resource "aws_api_gateway_integration" "get_integration" {
+#   rest_api_id             =
+#   resource_id             =
+#   http_method             =
+#   integration_http_method = "POST"
+#   type                    = "AWS"
+#   uri                     = #uri?
+#   request_templates = {
+#     "application/json" = <<EOF
+#     { 
+#       "short_id": "$input.params('shortid')" 
+#     }
+#     EOF
+#   }
+# }
+
+# resource "aws_api_gateway_method_response" "response_302" {
+#   rest_api_id =
+#   resource_id =
+#   http_method =
+#   status_code = "302"
+
+#   response_parameters = {
+#     "method.response.header.Location" = true
+#   }
+# }
+
+# resource "aws_api_gateway_integration_response" "get_integration_response" {
+#   rest_api_id =
+#   resource_id =
+#   http_method =
+#   status_code = aws_api_gateway_method_response.response_302.status_code
+
+#   response_parameters = {
+#     "method.response.header.Location" = "integration.response.body.location"
+#   }
+#   depends_on = [
+#     aws_api_gateway_integration.get_integration
+#   ]
+# }
